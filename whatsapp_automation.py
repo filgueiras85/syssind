@@ -2,6 +2,7 @@ import pandas as pd
 import time
 import pyperclip
 import re
+import sys
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -21,25 +22,53 @@ DELAY_BETWEEN_MESSAGES = 8
 
 # ==================== FUNÇÕES DE AUTOMAÇÃO ====================
 
+def encontrar_campo_busca(driver, wait):
+    """
+    Tenta encontrar o campo de busca usando múltiplos seletores conhecidos.
+    """
+    seletores = [
+        (By.CSS_SELECTOR, 'input[role="textbox"][aria-label="Pesquisar ou começar uma nova conversa"]'),
+        (By.CSS_SELECTOR, 'div[contenteditable="true"][data-tab="3"]'),
+        (By.XPATH, '//div[@contenteditable="true"][@data-tab="3"]'),
+        (By.XPATH, '//div[@role="textbox"][@aria-label="Pesquisar ou começar uma nova conversa"]')
+    ]
+    
+    for by, seletor in seletores:
+        try:
+            # Tenta localizar o elemento e garantir que ele está visível e clicável
+            elemento = wait.until(EC.element_to_be_clickable((by, seletor)))
+            if elemento:
+                return elemento
+        except:
+            continue
+    return None
+
 def pesquisar_grupo(driver, wait, nome_grupo):
     """
-    Pesquisa o grupo usando o seletor exato fornecido pelo usuário:
-    <input role="textbox" aria-label="Pesquisar ou começar uma nova conversa" ...>
+    Pesquisa o grupo com lógica de limpeza e digitação resiliente.
     """
     try:
         print(f"     🔍 Pesquisando: {nome_grupo}")
         
-        # Seletor exato do input de busca fornecido no HTML
-        seletor_busca = 'input[role="textbox"][aria-label="Pesquisar ou começar uma nova conversa"]'
+        campo_busca = encontrar_campo_busca(driver, wait)
         
-        campo_busca = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, seletor_busca)))
+        if not campo_busca:
+            # Se não encontrar, tenta um clique forçado na área lateral para "acordar" o elemento
+            driver.execute_script("document.querySelector('#side').click();")
+            time.sleep(1)
+            campo_busca = encontrar_campo_busca(driver, wait)
+            
+        if not campo_busca:
+            raise Exception("Campo de busca não localizado após múltiplas tentativas.")
         
-        # Limpeza e digitação
+        # Limpeza robusta
         campo_busca.click()
+        time.sleep(0.3)
         campo_busca.send_keys(Keys.CONTROL + "a")
         campo_busca.send_keys(Keys.BACKSPACE)
         time.sleep(0.5)
         
+        # Digitação pausada para evitar erros de buffer do navegador
         for char in nome_grupo:
             campo_busca.send_keys(char)
             time.sleep(0.05)
@@ -47,17 +76,15 @@ def pesquisar_grupo(driver, wait, nome_grupo):
         time.sleep(DELAY_SEARCH)
         return True
     except Exception as e:
-        print(f"     ❌ Erro ao localizar campo de busca: {e}")
+        print(f"     ❌ Erro ao pesquisar: {str(e)[:100]}")
         return False
 
 def selecionar_grupo_da_lista(driver, nome_grupo):
     """
-    Seleciona o grupo da lista de resultados usando a estrutura de row/gridcell fornecida:
-    <div role="row" ...> <span title="NOME DO GRUPO" ...>
+    Seleciona o grupo da lista de resultados usando JavaScript para maior precisão.
     """
     try:
-        # Busca o elemento que contém o título do grupo nos resultados da pesquisa
-        # O script tenta clicar no elemento que contém o texto exato ou parcial do grupo
+        # Tenta clicar no elemento que contém o título do grupo nos resultados
         clicado = driver.execute_script("""
             const nomeAlvo = arguments[0].toLowerCase();
             // Busca em spans que costumam conter o título do grupo/contato
@@ -66,7 +93,7 @@ def selecionar_grupo_da_lista(driver, nome_grupo):
             for (let el of elementos) {
                 let texto = (el.getAttribute('title') || el.textContent || "").toLowerCase();
                 if (texto.includes(nomeAlvo)) {
-                    // Sobe até o container clicável (role="row" ou role="gridcell")
+                    // Sobe até o container clicável
                     let container = el.closest('div[role="row"]') || el.closest('div[role="gridcell"]') || el;
                     container.click();
                     return true;
@@ -79,12 +106,15 @@ def selecionar_grupo_da_lista(driver, nome_grupo):
             print(f"     ✅ Grupo '{nome_grupo}' selecionado.")
             return True
         else:
-            print(f"     ⚠️ Grupo não encontrado na lista visual. Tentando ENTER...")
-            # Fallback: pressionar ENTER no campo de busca
-            driver.find_element(By.CSS_SELECTOR, 'input[role="textbox"][aria-label="Pesquisar ou começar uma nova conversa"]').send_keys(Keys.ENTER)
-            return True
+            # Fallback: pressionar ENTER no campo de busca se o clique falhar
+            print(f"     ⚠️ Grupo não clicado via JS. Tentando ENTER...")
+            campo = encontrar_campo_busca(driver, WebDriverWait(driver, 5))
+            if campo:
+                campo.send_keys(Keys.ENTER)
+                return True
+            return False
     except Exception as e:
-        print(f"     ❌ Erro ao selecionar grupo: {e}")
+        print(f"     ❌ Erro ao selecionar grupo: {str(e)[:100]}")
         return False
 
 def enviar_mensagem(driver, wait, mensagem):
@@ -92,17 +122,16 @@ def enviar_mensagem(driver, wait, mensagem):
     Envia a mensagem na caixa de texto do chat aberto.
     """
     try:
-        # Seletores comuns para a caixa de mensagem do WhatsApp Web
         seletores_msg = [
-            'div[contenteditable="true"][role="textbox"]',
-            'footer div[contenteditable="true"]',
-            'div[data-tab="10"]'
+            (By.CSS_SELECTOR, 'div[contenteditable="true"][role="textbox"]'),
+            (By.CSS_SELECTOR, 'footer div[contenteditable="true"]'),
+            (By.XPATH, '//div[@contenteditable="true"][@data-tab="10"]')
         ]
         
         caixa_msg = None
-        for sel in seletores_msg:
+        for by, sel in seletores_msg:
             try:
-                caixa_msg = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+                caixa_msg = wait.until(EC.element_to_be_clickable((by, sel)))
                 if caixa_msg: break
             except: continue
             
@@ -113,7 +142,7 @@ def enviar_mensagem(driver, wait, mensagem):
         caixa_msg.click()
         time.sleep(0.5)
         
-        # Usa clipboard para garantir que emojis e links longos funcionem bem
+        # Usa clipboard para garantir que emojis e links funcionem bem
         pyperclip.copy(mensagem)
         caixa_msg.send_keys(Keys.CONTROL + "v")
         
@@ -121,17 +150,17 @@ def enviar_mensagem(driver, wait, mensagem):
         time.sleep(DELAY_AFTER_LINK)
         
         caixa_msg.send_keys(Keys.ENTER)
-        print("     ✅ Mensagem enviada com sucesso.")
+        print("     ✅ Mensagem enviada.")
         return True
     except Exception as e:
-        print(f"     ❌ Erro ao enviar mensagem: {e}")
+        print(f"     ❌ Erro no envio: {str(e)[:100]}")
         return False
 
 # ==================== FLUXO PRINCIPAL ====================
 
 def main():
     print("\n" + "="*60)
-    print("🚀 AUTOMAÇÃO WHATSAPP - VERSÃO OTIMIZADA (HTML PRECISO)")
+    print("🚀 AUTOMAÇÃO WHATSAPP - VERSÃO RESILIENTE")
     print("="*60)
 
     # 1. Carregar Dados do Excel
@@ -150,6 +179,10 @@ def main():
                     temp_df.columns = ['Grupo', 'Mensagem']
                     all_data.append(temp_df)
         
+        if not all_data:
+            print("❌ Nenhuma aba encontrada ou abas vazias.")
+            return
+            
         df_final = pd.concat(all_data, ignore_index=True)
         print(f"✅ {len(df_final)} mensagens para processar.")
     except Exception as e:
@@ -192,16 +225,23 @@ def main():
         
         print(f"\n[{idx+1}/{len(df_final)}] Processando: {grupo}")
         
-        if pesquisar_grupo(driver, wait, grupo):
-            if selecionar_grupo_da_lista(driver, grupo):
-                time.sleep(DELAY_AFTER_OPEN_CHAT)
-                enviar_mensagem(driver, wait, msg)
+        try:
+            if pesquisar_grupo(driver, wait, grupo):
+                if selecionar_grupo_da_lista(driver, grupo):
+                    time.sleep(DELAY_AFTER_OPEN_CHAT)
+                    enviar_mensagem(driver, wait, msg)
+                else:
+                    print(f"     ❌ Falha ao selecionar o grupo '{grupo}'.")
+            else:
+                print(f"     ❌ Falha ao pesquisar o grupo '{grupo}'.")
+        except Exception as e:
+            print(f"     ❌ Erro inesperado no loop: {str(e)[:100]}")
         
         print(f"     ⏳ Intervalo de {DELAY_BETWEEN_MESSAGES}s...")
         time.sleep(DELAY_BETWEEN_MESSAGES)
 
     print("\n" + "="*60)
-    print("🏁 PROCESSO CONCLUÍDO COM SUCESSO!")
+    print("🏁 PROCESSO CONCLUÍDO!")
     print("="*60)
 
 if __name__ == "__main__":
