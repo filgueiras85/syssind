@@ -2,6 +2,7 @@ import pandas as pd
 import time
 import pyperclip
 import re
+import sys
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -22,268 +23,246 @@ DELAY_BETWEEN_MESSAGES = 8
 # ==================== FUNÇÕES AUXILIARES ====================
 
 def debug_nomes_grupos(driver):
-    """Função para debug - mostra todos os grupos encontrados"""
-    print("\n     🔍 LISTANDO GRUPOS DISPONÍVEIS:")
-    grupos = driver.execute_script("""
-        let grupos = [];
-        let elementos = document.querySelectorAll('div[role="row"], div[data-testid="cell-frame-container"]');
-        elementos.forEach(el => {
-            let texto = el.textContent || el.innerText;
-            if (texto && texto.trim().length > 0 && texto.length < 100) {
-                grupos.push(texto.trim());
-            }
-        });
-        return grupos.slice(0, 20);  // Mostra apenas os primeiros 20
-    """)
-    
-    for i, grupo in enumerate(grupos, 1):
-        print(f"     {i}. {grupo}")
+    """Função para debug - mostra todos os grupos encontrados na barra lateral"""
+    print("\n     🔍 LISTANDO GRUPOS DISPONÍVEIS NA BARRA LATERAL:")
+    try:
+        grupos = driver.execute_script("""
+            let grupos = [];
+            let elementos = document.querySelectorAll('span[title], div[role="listitem"] span');
+            elementos.forEach(el => {
+                let texto = el.getAttribute('title') || el.textContent;
+                if (texto && texto.trim().length > 0 && texto.length < 50) {
+                    grupos.push(texto.trim());
+                }
+            });
+            return [...new Set(grupos)].slice(0, 15); 
+        """)
+        for i, grupo in enumerate(grupos, 1):
+            print(f"     {i}. {grupo}")
+    except:
+        print("     ⚠️ Não foi possível listar os grupos.")
     print()
-    return grupos
 
-def encontrar_campo_busca(wait, driver):
-    """Encontra o campo de busca do WhatsApp"""
+def encontrar_campo_busca(wait):
+    """Encontra o campo de busca do WhatsApp com seletores atualizados"""
     seletores = [
-        'div[contenteditable="true"][data-tab="3"]',
-        'div[contenteditable="true"][aria-label*="Pesquisar"]',
-        'div[contenteditable="true"][title*="Pesquisar"]',
+        (By.XPATH, '//div[@contenteditable="true"][@data-tab="3"]'),
+        (By.XPATH, '//div[@contenteditable="true"][@aria-label="Pesquisar ou começar uma nova conversa"]'),
+        (By.CSS_SELECTOR, 'div[contenteditable="true"][data-tab="3"]'),
+        (By.CSS_SELECTOR, 'div[role="textbox"][aria-label*="Pesquisar"]')
     ]
     
-    for seletor in seletores:
+    for by, seletor in seletores:
         try:
-            el = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, seletor)))
-            print(f"     🔎 Campo de busca encontrado")
+            el = wait.until(EC.element_to_be_clickable((by, seletor)))
             return el
         except:
             continue
-    
-    raise Exception("❌ Campo de busca não encontrado")
+    return None
 
 def buscar_e_clicar_grupo(driver, wait, grupo_nome):
-    """Busca e clica no grupo usando múltiplas estratégias"""
-    
+    """Busca e clica no grupo com lógica de limpeza e clique forçado"""
     try:
         print(f"     🔍 Buscando: {grupo_nome}")
+        campo_busca = encontrar_campo_busca(wait)
         
-        # Limpa o campo de busca
-        campo_busca = encontrar_campo_busca(wait, driver)
+        if not campo_busca:
+            print("     ❌ Campo de busca não encontrado.")
+            return False
+
+        # Limpeza robusta do campo
         campo_busca.click()
-        # Usar CONTROL+A e BACKSPACE para garantir limpeza
+        time.sleep(0.5)
         campo_busca.send_keys(Keys.CONTROL + "a")
         campo_busca.send_keys(Keys.BACKSPACE)
         time.sleep(0.5)
         
-        # Digita o nome do grupo
+        # Digitação pausada
         for char in grupo_nome:
             campo_busca.send_keys(char)
             time.sleep(0.05)
         
-        # Delay após pesquisa solicitado
         time.sleep(DELAY_SEARCH)
-        
-        # Tenta encontrar o grupo na lista via script para maior precisão
-        grupo_encontrado = driver.execute_script(f"""
-            const nomeBusca = arguments[0];
-            const elementos = document.querySelectorAll('div[role="row"], div[data-testid="cell-frame-container"]');
-            
-            for (let el of elementos) {{
-                let texto = el.textContent || el.innerText;
-                if (texto && texto.includes(nomeBusca)) {{
-                    el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                    return el;
-                }}
-            }}
-            return null;
+
+        # Tenta clicar no resultado via JavaScript (mais confiável para elementos dinâmicos)
+        clicado = driver.execute_script("""
+            const nome = arguments[0].toLowerCase();
+            const spans = document.querySelectorAll('span[title]');
+            for (let span of spans) {
+                if (span.title.toLowerCase().includes(nome) || span.textContent.toLowerCase().includes(nome)) {
+                    let target = span.closest('div[role="row"]') || span.closest('div[data-testid="cell-frame-container"]') || span;
+                    target.click();
+                    return true;
+                }
+            }
+            return false;
         """, grupo_nome)
-        
-        if grupo_encontrado:
-            time.sleep(0.5)
-            driver.execute_script("arguments[0].click();", grupo_encontrado)
-            print(f"     ✅ Grupo encontrado e clicado")
+
+        if clicado:
+            print(f"     ✅ Grupo clicado com sucesso.")
             return True
         else:
-            # Tenta a estratégia do ENTER se não encontrar o elemento clicável
-            campo_busca.send_keys(Keys.ENTER)
             print(f"     🔄 Tentando abrir via ENTER...")
+            campo_busca.send_keys(Keys.ENTER)
             return True
             
     except Exception as e:
-        print(f"     ⚠️ Erro ao buscar grupo: {e}")
-    
+        print(f"     ⚠️ Erro na busca: {str(e)[:50]}")
     return False
 
 def enviar_mensagem_simples(driver, wait, mensagem):
-    """Envia mensagem de forma simples e confiável"""
+    """Envia mensagem usando clipboard para evitar problemas com caracteres especiais"""
     try:
-        # Tenta encontrar a caixa de mensagem
         seletores = [
-            'div[contenteditable="true"][role="textbox"]',
-            'div[contenteditable="true"][data-lexical-editor="true"]',
-            'footer div[contenteditable="true"]',
-            '#main div[contenteditable="true"]'
+            (By.XPATH, '//div[@contenteditable="true"][@data-tab="10"]'),
+            (By.CSS_SELECTOR, 'footer div[contenteditable="true"]'),
+            (By.CSS_SELECTOR, 'div[role="textbox"][aria-label*="Digite uma mensagem"]')
         ]
         
         caixa_msg = None
-        for seletor in seletores:
+        for by, seletor in seletores:
             try:
-                caixa_msg = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, seletor)))
-                print(f"     📝 Caixa de mensagem encontrada")
+                caixa_msg = wait.until(EC.element_to_be_clickable((by, seletor)))
                 break
             except:
                 continue
         
         if not caixa_msg:
-            print("     ❌ Caixa de mensagem não encontrada")
+            print("     ❌ Caixa de mensagem não encontrada.")
             return False
         
-        # Limpa e foca na caixa
         caixa_msg.click()
-        # Garante que está limpo
-        caixa_msg.send_keys(Keys.CONTROL + "a")
-        caixa_msg.send_keys(Keys.BACKSPACE)
         time.sleep(0.5)
         
-        # Digita a mensagem usando clipboard para manter formatação/emojis
+        # Copia para o clipboard e cola
         pyperclip.copy(mensagem)
         caixa_msg.send_keys(Keys.CONTROL + "v")
         
-        # Delay após colar o link/mensagem solicitado
         time.sleep(DELAY_AFTER_LINK)
-        
-        # Envia
         caixa_msg.send_keys(Keys.ENTER)
-        print("     ✅ Mensagem enviada")
-        return True
         
+        print("     ✅ Mensagem enviada.")
+        return True
     except Exception as e:
-        print(f"     ❌ Erro ao enviar mensagem: {e}")
+        print(f"     ❌ Erro no envio: {str(e)[:50]}")
         return False
 
 def verificar_grupo_aberto(driver, grupo_nome):
-    """Verifica se o grupo correto foi aberto"""
+    """Verifica se o chat aberto é o correto"""
     try:
-        header = driver.find_element(By.CSS_SELECTOR, 'div[data-testid="conversation-title"]')
-        texto_header = header.text
-        print(f"     📌 Header da conversa: {texto_header}")
+        # Tenta múltiplos seletores para o título do chat
+        seletores_titulo = [
+            'span[data-testid="conversation-info-header-chat-title"]',
+            'div[data-testid="conversation-title"]',
+            'header span[title]'
+        ]
         
-        # Verifica se o nome do grupo está no header (ignora case e espaços extras)
-        if grupo_nome.lower().strip() in texto_header.lower().strip() or texto_header.lower().strip() in grupo_nome.lower().strip():
-            return True
+        titulo_atual = ""
+        for seletor in seletores_titulo:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, seletor)
+                titulo_atual = el.get_attribute('title') or el.text
+                if titulo_atual: break
+            except:
+                continue
+        
+        if not titulo_atual:
+            return True # Fallback se não conseguir ler o título
             
+        print(f"     📌 Chat aberto: {titulo_atual}")
+        nome_limpo = re.sub(r'[^\w]', '', grupo_nome.lower())
+        titulo_limpo = re.sub(r'[^\w]', '', titulo_atual.lower())
+        
+        return nome_limpo in titulo_limpo or titulo_limpo in nome_limpo
     except:
-        pass
-    
-    return False
+        return True
 
-# ==================== INÍCIO DO SCRIPT ====================
+# ==================== EXECUÇÃO ====================
 
 def main():
-    print("=" * 60)
-    print("ENVIO DE MENSAGENS PARA WHATSAPP WEB (BASEADO NO SCRIPT NOVO)")
-    print("=" * 60)
+    print("\n" + "="*60)
+    print("🚀 INICIANDO AUTOMAÇÃO WHATSAPP")
+    print("="*60)
 
-    # 1. Leitura do Excel (Múltiplas abas)
+    # 1. Carregar Excel
     try:
-        print(f"📂 Lendo arquivo: {EXCEL_FILE}")
-        dfs = pd.read_excel(EXCEL_FILE, sheet_name=SHEETS)
-        # Concatena todas as abas e remove linhas onde o nome do grupo ou mensagem estão vazios
-        df = pd.concat(dfs, ignore_index=True).dropna(subset=['Nome do Grupo', 'Mensagem'])
-        df = df.astype({'Nome do Grupo': str, 'Mensagem': str})
-        print(f"✅ {len(df)} mensagens carregadas de {len(SHEETS)} abas.")
+        print(f"📂 Lendo: {EXCEL_FILE}")
+        all_data = []
+        with pd.ExcelFile(EXCEL_FILE) as xls:
+            for sheet in SHEETS:
+                if sheet in xls.sheet_names:
+                    df_sheet = pd.read_excel(xls, sheet_name=sheet)
+                    # Tenta encontrar as colunas corretas independente do nome exato
+                    col_grupo = [c for c in df_sheet.columns if 'grupo' in c.lower()][0]
+                    col_msg = [c for c in df_sheet.columns if 'mensagem' in c.lower()][0]
+                    
+                    temp_df = df_sheet[[col_grupo, col_msg]].dropna()
+                    temp_df.columns = ['Grupo', 'Mensagem']
+                    all_data.append(temp_df)
+        
+        if not all_data:
+            print("❌ Nenhuma aba encontrada ou abas vazias.")
+            return
+            
+        df_final = pd.concat(all_data, ignore_index=True)
+        print(f"✅ {len(df_final)} mensagens carregadas.")
     except Exception as e:
-        print(f"❌ Erro ao ler Excel: {e}")
+        print(f"❌ Erro ao processar Excel: {e}")
         return
 
-    # 2. Conectar ao Chrome (Usando porta de debug como no seu script base)
+    # 2. Conectar ao Chrome
     options = Options()
     options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-
+    
     try:
         driver = webdriver.Chrome(options=options)
-        wait = WebDriverWait(driver, 20)
+        wait = WebDriverWait(driver, 15)
         print("✅ Conectado ao Chrome (Porta 9222)")
     except Exception as e:
-        print(f"❌ Erro de conexão: {e}")
-        print("\n👉 Lembre-se de abrir o Chrome com o comando:")
-        print("chrome.exe --remote-debugging-port=9222")
+        print("\n❌ ERRO: Não foi possível conectar ao Chrome.")
+        print("👉 Certifique-se de que o Chrome foi aberto com: chrome.exe --remote-debugging-port=9222")
         return
 
-    # 3. Verificar WhatsApp Web
-    whatsapp_handle = None
-    for handle in driver.window_handles:
-        driver.switch_to.window(handle)
-        if "web.whatsapp.com" in driver.current_url:
-            whatsapp_handle = handle
-            break
-
-    if not whatsapp_handle:
-        print("❌ WhatsApp Web não encontrado nas abas abertas.")
-        return
-
-    driver.switch_to.window(whatsapp_handle)
-    print("✅ WhatsApp Web localizado.")
-    time.sleep(3)
-
-    # 4. Modo debug inicial
-    debug_nomes_grupos(driver)
-    input("\n⚠️  Verifique se os grupos estão visíveis. Pressione ENTER para iniciar os envios...")
-
-    # 5. Loop de Envio
-    sucesso = 0
-    falhas = 0
-
-    for idx, row in df.iterrows():
-        grupo = row['Nome do Grupo'].strip()
-        msg = row['Mensagem'].strip()
-        
-        print(f"\n{'='*50}")
-        print(f"[{idx+1}/{len(df)}] Processando: {grupo}")
-        print(f"     Mensagem: {msg[:40]}...")
-        print('='*50)
-        
-        try:
-            # Busca e clica no grupo
-            if buscar_e_clicar_grupo(driver, wait, grupo):
-                # Delay após abrir o chat solicitado
-                time.sleep(DELAY_AFTER_OPEN_CHAT)
-                
-                # Verifica se o grupo correto foi aberto
-                if verificar_grupo_aberto(driver, grupo):
-                    print("     ✅ Grupo validado")
-                    
-                    # Envia mensagem
-                    if enviar_mensagem_simples(driver, wait, msg):
-                        sucesso += 1
-                    else:
-                        falhas += 1
-                else:
-                    falhas += 1
-                    print(f"     ❌ Grupo aberto não corresponde ao esperado")
+    # 3. Validar WhatsApp
+    try:
+        if "web.whatsapp.com" not in driver.current_url:
+            print("⚠️  WhatsApp Web não está na aba ativa. Tentando localizar...")
+            for handle in driver.window_handles:
+                driver.switch_to.window(handle)
+                if "web.whatsapp.com" in driver.current_url:
+                    break
             else:
-                falhas += 1
-                print(f"     ❌ Falha ao localizar o grupo")
-                
-        except Exception as e:
-            falhas += 1
-            print(f"     ❌ Erro inesperado: {e}")
+                print("❌ WhatsApp Web não encontrado. Abra-o no navegador.")
+                return
+    except:
+        print("❌ Erro ao acessar abas do navegador.")
+        return
+
+    print("✅ WhatsApp Web detectado.")
+    debug_nomes_grupos(driver)
+    input("\n⚠️  Pressione ENTER para começar os envios...")
+
+    # 4. Loop de Envio
+    for idx, row in df_final.iterrows():
+        grupo = str(row['Grupo']).strip()
+        msg = str(row['Mensagem']).strip()
         
-        # Delay entre mensagens solicitado
-        print(f"     ⏳ Aguardando {DELAY_BETWEEN_MESSAGES}s para o próximo...")
+        print(f"\n[{idx+1}/{len(df_final)}] Grupo: {grupo}")
+        
+        if buscar_e_clicar_grupo(driver, wait, grupo):
+            time.sleep(DELAY_AFTER_OPEN_CHAT)
+            
+            if verificar_grupo_aberto(driver, grupo):
+                enviar_mensagem_simples(driver, wait, msg)
+            else:
+                print("     ❌ Falha na validação do nome do grupo.")
+        
+        print(f"     ⏳ Aguardando {DELAY_BETWEEN_MESSAGES}s...")
         time.sleep(DELAY_BETWEEN_MESSAGES)
 
-    # 6. Resumo Final
     print("\n" + "="*60)
-    print("RESUMO DA OPERAÇÃO")
+    print("🏁 PROCESSO CONCLUÍDO")
     print("="*60)
-    print(f"✅ Sucesso: {sucesso}")
-    print(f"❌ Falhas:  {falhas}")
-    print(f"📊 Total:   {sucesso + falhas}")
-    print("="*60)
-
-    fechar = input("\nDeseja encerrar o navegador? (s/n): ")
-    if fechar.lower() == 's':
-        driver.quit()
-        print("Navegador encerrado.")
 
 if __name__ == "__main__":
     main()
